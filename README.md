@@ -11,7 +11,12 @@
 - `check_dlc_dataset.py` — проверка покрытия размеченного датасета.
 - `check_dlc_shuffles.py` — проверка состояния шaфлов/снапшотов обучения.
 - `rt_dlc_obs.py` — realtime-инференс DLC + оверлей в OpenCV окне.
-- `config_rt_dlc.py` — runtime-конфиг для realtime режима.
+- `config_rt_dlc.py` — runtime-конфиг для realtime режима (`rt_dlc_obs.py`).
+- `rt_dlc_live.py` — альтернативный low-latency runtime через DLCLive.
+- `config_rt_dlc_live.py` — конфиг для `rt_dlc_live.py`.
+- `rt_dlc_config_gui.py` — графический runtime-конфигуратор (замена ручного редактирования `config_rt_dlc.py`) с валидацией и учетом зависимостей.
+- `check_online_buffering.py` — утилита для многократной проверки/диагностики буферизации (симуляция + сводка benchmark CSV).
+- `README_DLC_live.md` — отдельная документация по DLCLive режиму.
 
 ## Быстрый старт
 
@@ -57,10 +62,36 @@ python run_dlc.py labeled
 python run_dlc.py metrics
 ```
 
-### 4) Realtime режим
+### 4) Realtime режим (основной)
 
 ```bash
 python rt_dlc_obs.py
+```
+
+### 4.1) GUI-настройка runtime + запуск
+
+```bash
+python rt_dlc_config_gui.py
+```
+
+В GUI:
+- меняются значения параметров из `config_rt_dlc.py`,
+- автоматически считается производный cap (например, по `source_fps / INFER_EVERY_N_FRAMES`),
+- при `Start` применяются значения, выполняется валидация, окно закрывается и стартует `rt_dlc_obs`.
+
+### 5) Альтернатива: DLCLive runtime
+
+```bash
+python rt_dlc_live.py
+```
+
+Подробности и настройка: `README_DLC_live.md`.
+
+### 6) Проверка буферизации (многократно)
+
+```bash
+python check_online_buffering.py simulate --buffers 0 20 40 80 120 --repeats 10
+python check_online_buffering.py summarize-csv --csv C:\\dlc\\DLC_OBS_Spinal_cord_stimulation\\rt_dlc_benchmark.csv
 ```
 
 Новый realtime-пайплайн работает **без OBS Virtual Camera**: источник кадров выбирается в `config_rt_dlc.py` через `USE_VIDEO_FILE`:
@@ -79,6 +110,7 @@ python rt_dlc_obs.py
 - `INFER_EVERY_N_FRAMES` и `TARGET_INFER_FPS`,
 - `USE_ROI` и `ROI` (фиксированный рабочий crop),
 - `DISPLAY_BUFFER_MS`, `MAX_FRAME_BUFFER`, `MAX_PRED_BUFFER`.
+- для online-контроля буфера: `BUFFER_DIAG_EVERY_N_FRAMES`, `BUFFER_DIAG_WARN_MIN_SAMPLES`, `BUFFER_DIAG_RESET_AFTER_LOG`.
 
 Логи realtime пишутся в:
 - `C:\dlc\DLC_OBS_Spinal_cord_stimulation\rt_dlc_debug.log`
@@ -88,6 +120,8 @@ python rt_dlc_obs.py
 - `raw_visible` vs `filtered_visible`,
 - skip-счетчики по причинам (`skip_duplicate`, `skip_motion`, `skip_n`, `skip_fps`),
 - тайминги стадий (`t_capture`, `t_pre`, `t_infer`, `t_post`, `t_draw`, `t_disp`).
+- отдельная строка `buffer_diag` с контролем буферизации: `target`, `actual_mean`, `err_mean`, `abs_err_mean`, `%on_target`, `%exact_match`, `%no_pred`, `%stale_drop`, а также длины `infer_q/frame_buf/pred_buf`.
+- в overlay рядом с `Hind angle` рисуется текущий статус буфера: `BUF <actual>/<target>ms OK|BAD delta_f=<...>`.
 
 ## Что проверено и отполировано
 

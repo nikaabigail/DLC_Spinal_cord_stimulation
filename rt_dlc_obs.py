@@ -99,12 +99,16 @@ class VideoFileSource(FrameSource):
         self.frame_id = 0
         self.start_ts: float | None = None
         self.frame_interval = (1.0 / target_fps) if target_fps and target_fps > 0 else None
+        self.source_fps = 0.0
+        self.dropped_total = 0
+        self.last_drop_count = 0
 
     def open(self) -> None:
         self.cap = cv2.VideoCapture(str(self.video_path))
         if not self.cap.isOpened():
             raise RuntimeError(f"Cannot open video file: {self.video_path}")
         self.start_ts = time.perf_counter()
+        self.source_fps = float(self.cap.get(cv2.CAP_PROP_FPS) or 0.0)
 
     def read(self) -> tuple[bool, Optional[FramePacket]]:
         if self.cap is None:
@@ -115,6 +119,7 @@ class VideoFileSource(FrameSource):
             return False, None
 
         self.frame_id += 1
+        self.last_drop_count = 0
 
         if self.frame_interval is not None and self.start_ts is not None:
             expected_elapsed = self.frame_id * self.frame_interval
@@ -124,8 +129,16 @@ class VideoFileSource(FrameSource):
             if lag < 0:
                 time.sleep(-lag)
             elif lag > self.frame_interval and self.skip_if_behind:
-                # drop one stale frame to catch up
-                _ = self.cap.read()
+                drops_needed = max(1, min(int(lag / self.frame_interval), 10))
+                dropped_now = 0
+                for _ in range(drops_needed):
+                    drop_ok, _ = self.cap.read()
+                    if not drop_ok:
+                        break
+                    self.frame_id += 1
+                    dropped_now += 1
+                self.last_drop_count = dropped_now
+                self.dropped_total += dropped_now
 
         return True, FramePacket(frame_id=self.frame_id, frame=frame, capture_ts=time.time())
 
@@ -148,19 +161,6 @@ def build_frame_source() -> FrameSource:
 # =========================
 # Geometry / helper utils
 # =========================
-def crop_roi(frame: np.ndarray) -> np.ndarray:
-    if not config.USE_ROI:
-        return frame
-    x1, y1, x2, y2 = config.ROI
-    h, w = frame.shape[:2]
-    if not (0 <= x1 < x2 <= w and 0 <= y1 < y2 <= h):
-        raise ValueError(
-            f"Invalid ROI={config.ROI} for frame size {(w, h)}. "
-            "Expected 0 <= x1 < x2 <= width and 0 <= y1 < y2 <= height."
-        )
-    return frame[y1:y2, x1:x2]
-
-
 def resize_for_infer(frame: np.ndarray) -> np.ndarray:
     return cv2.resize(frame, (config.INFER_W, config.INFER_H), interpolation=cv2.INTER_LINEAR)
 
@@ -314,23 +314,15 @@ def validate_runtime_config() -> None:
             raise ValueError("ROI must be a tuple of 4 integers: (x1, y1, x2, y2).")
     if getattr(config, "INFER_QUEUE_MAXSIZE", 2) <= 0:
         raise ValueError("INFER_QUEUE_MAXSIZE must be positive.")
-    if getattr(config, "DISPLAY_DELAY_MS", 0) < 0:
-        raise ValueError("DISPLAY_DELAY_MS must be >= 0.")
-    if getattr(config, "MAX_RESULT_HISTORY", 10) <= 0:
-        raise ValueError("MAX_RESULT_HISTORY must be positive.")
     if getattr(config, "INFER_EVERY_N_FRAMES", 1) <= 0:
         raise ValueError("INFER_EVERY_N_FRAMES must be positive.")
     if getattr(config, "TARGET_INFER_FPS", 1.0) <= 0:
         raise ValueError("TARGET_INFER_FPS must be positive.")
-    if getattr(config, "FORCE_FIXED_ROI", False) and getattr(config, "AUTO_DETECT_CONTENT_ROI", False):
-        raise ValueError("AUTO_DETECT_CONTENT_ROI must be False when FORCE_FIXED_ROI=True.")
-    if getattr(config, "AUTO_START_ON_MOTION", False) and (
-        getattr(config, "SUPPRESS_LOW_MOTION", False) or getattr(config, "SKIP_NEAR_DUPLICATE_FRAMES", False)
-    ):
-        raise ValueError(
-            "With AUTO_START_ON_MOTION=True, disable SUPPRESS_LOW_MOTION and SKIP_NEAR_DUPLICATE_FRAMES "
-            "to avoid conflicting gating states."
-        )
+    runtime_mode = str(getattr(config, "RUNTIME_MODE", "visual")).strip().lower()
+    if runtime_mode not in {"visual", "background"}:
+        raise ValueError("RUNTIME_MODE must be either 'visual' or 'background'.")
+    if bool(getattr(config, "SAVE_OUTPUT_VIDEO", False)) and not getattr(config, "OUTPUT_VIDEO_PATH", None):
+        raise ValueError("OUTPUT_VIDEO_PATH must be set when SAVE_OUTPUT_VIDEO=True.")
 
     src_fps = float(getattr(config, "VIDEO_TARGET_FPS", 0.0) if getattr(config, "USE_VIDEO_FILE", False) else getattr(config, "TARGET_VIDEO_FPS", 0.0))
     if src_fps > 0:
@@ -348,6 +340,17 @@ def validate_runtime_config() -> None:
         raise ValueError("STALE_PRED_MAX_MS must be >= 0.")
     if float(getattr(config, "OVERLAY_HOLD_MS", 0.0)) < 0:
         raise ValueError("OVERLAY_HOLD_MS must be >= 0.")
+
+
+def estimate_frame_buffer_capacity_ms() -> float:
+    source_fps = float(
+        getattr(config, "VIDEO_TARGET_FPS", 0.0)
+        if getattr(config, "USE_VIDEO_FILE", False)
+        else getattr(config, "TARGET_VIDEO_FPS", 0.0)
+    )
+    if source_fps <= 0:
+        return 0.0
+    return (float(getattr(config, "MAX_FRAME_BUFFER", 1)) / source_fps) * 1000.0
 
 
 def setup_logger() -> logging.Logger:
@@ -434,11 +437,7 @@ class OnlinePointFilter:
             gap = frame_idx - state.last_good_frame_idx
             if gap <= config.MAX_HOLD_FRAMES:
                 hold_x, hold_y = state.last_good_xy
-                state.x_hist.append(hold_x)
-                state.y_hist.append(hold_y)
-                x_med = float(np.median(np.array(state.x_hist, dtype=np.float32)))
-                y_med = float(np.median(np.array(state.y_hist, dtype=np.float32)))
-                return x_med, y_med, float(config.CONF_THRESH_USE + 0.01)
+                return hold_x, hold_y, float(max(config.CONF_THRESH_DRAW, config.CONF_THRESH_USE) + 0.01)
 
         return None, None, None
 
@@ -625,6 +624,7 @@ def draw_overlay(
     fps_dlc: float,
     skip_rate: float,
     hind_angle: Optional[float],
+    buffer_status_text: Optional[str],
     processing_active: bool,
     motion_score: float,
 ) -> np.ndarray:
@@ -651,9 +651,19 @@ def draw_overlay(
             y0 += 25
             cv2.putText(out, f"CAM FPS: {fps_cam:.1f} | DLC FPS: {fps_dlc:.1f} | SKIP RATE: {skip_rate:.1f}%", (10, y0), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
-    if config.DRAW_HIND_ANGLE and hind_angle is not None:
+    # Угол всегда рисуем, если он вычислен: это нужно, чтобы запись совпадала с online-наблюдением.
+    if hind_angle is not None:
         cv2.putText(out, f"Hind angle: {hind_angle:.1f}", (10, y0 + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+    if buffer_status_text:
+        cv2.putText(out, buffer_status_text, (10, y0 + 50), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 220, 255), 2)
     return out
+
+def is_visual_mode() -> bool:
+    runtime_mode = str(getattr(config, "RUNTIME_MODE", "visual")).strip().lower()
+    if runtime_mode not in {"visual", "background"}:
+        raise ValueError("RUNTIME_MODE must be either 'visual' or 'background'.")
+    return runtime_mode == "visual"
+
 
 def main() -> None:
     validate_runtime_config()
@@ -690,8 +700,62 @@ def main() -> None:
     stop_event = Event()
 
     csv_header_written = False
+    visual_mode = is_visual_mode()
+    save_output_video = bool(getattr(config, "SAVE_OUTPUT_VIDEO", False))
+    background_disable_stale_drop = bool(getattr(config, "BACKGROUND_DISABLE_STALE_DROP", True))
+    output_video_path = Path(getattr(config, "OUTPUT_VIDEO_PATH", "output_with_overlay.mp4"))
+    output_video_fps = float(getattr(config, "OUTPUT_VIDEO_FPS", 0.0))
+    video_writer: cv2.VideoWriter | None = None
 
-    logger.info("Pipeline started. source=%s roi=%s infer_size=(%s,%s)", type(source).__name__, config.ROI if config.USE_ROI else "full", config.INFER_W, config.INFER_H)
+    logger.info(
+        "Pipeline started. source=%s roi=%s infer_size=(%s,%s) mode=%s save_video=%s bg_disable_stale_drop=%s",
+        type(source).__name__,
+        config.ROI if config.USE_ROI else "full",
+        config.INFER_W,
+        config.INFER_H,
+        "visual" if visual_mode else "background",
+        save_output_video,
+        background_disable_stale_drop,
+    )
+    requested_buffer_ms = float(getattr(config, "DISPLAY_BUFFER_MS", 0.0))
+    frame_buffer_capacity_ms = estimate_frame_buffer_capacity_ms()
+    logger.info(
+        "Display buffering requested=%.1fms, estimated_frame_buffer_capacity=%.1fms (MAX_FRAME_BUFFER=%d)",
+        requested_buffer_ms,
+        frame_buffer_capacity_ms,
+        int(getattr(config, "MAX_FRAME_BUFFER", 0)),
+    )
+    if frame_buffer_capacity_ms > 0 and requested_buffer_ms > frame_buffer_capacity_ms:
+        logger.warning(
+            "DISPLAY_BUFFER_MS=%.1f exceeds estimated capacity %.1fms. "
+            "Increase MAX_FRAME_BUFFER or reduce source FPS for visible buffering effect.",
+            requested_buffer_ms,
+            frame_buffer_capacity_ms,
+        )
+    source_nominal_fps = float(
+        source.source_fps if isinstance(source, VideoFileSource) and source.source_fps > 0
+        else (
+            getattr(config, "VIDEO_TARGET_FPS", 0.0)
+            if getattr(config, "USE_VIDEO_FILE", False)
+            else getattr(config, "TARGET_VIDEO_FPS", 0.0)
+        )
+    )
+    buffer_tolerance_ms = (
+        max(8.0, 1000.0 / source_nominal_fps)
+        if source_nominal_fps > 0
+        else 16.0
+    )
+    buffer_diag = defaultdict(float)
+    buffer_diag_every_n = max(1, int(getattr(config, "BUFFER_DIAG_EVERY_N_FRAMES", 1)))
+    buffer_diag_warn_min_samples = max(10.0, float(getattr(config, "BUFFER_DIAG_WARN_MIN_SAMPLES", config.LOG_EVERY_N_FRAMES)))
+    buffer_diag_reset_after_log = bool(getattr(config, "BUFFER_DIAG_RESET_AFTER_LOG", False))
+    logger.info(
+        "Buffer diag enabled: every_n=%d warn_min_samples=%.0f reset_after_log=%s tolerance=±%.1fms",
+        buffer_diag_every_n,
+        buffer_diag_warn_min_samples,
+        buffer_diag_reset_after_log,
+        buffer_tolerance_ms,
+    )
 
     worker = Thread(
         target=inference_worker,
@@ -818,10 +882,7 @@ def main() -> None:
                 frame_buffer.popleft()
 
             if frame_buffer:
-                if frame_buffer[0].capture_ts <= target_display_ts:
-                    display_packet = frame_buffer[0]
-                else:
-                    display_packet = frame_buffer[0]  # fallback: oldest available
+                display_packet = frame_buffer[0]
 
             if display_packet is None:
                 continue
@@ -857,10 +918,12 @@ def main() -> None:
                 map_infer_shape = (infer_frame.shape[0], infer_frame.shape[1])
                 map_roi_offset = roi_offset
 
+            allow_stale_in_background = (not visual_mode) and background_disable_stale_drop
             stale_drop = (
                 pred_age_ms >= 0
                 and getattr(config, "STALE_PRED_POLICY", "show") == "drop"
                 and pred_age_ms > float(getattr(config, "STALE_PRED_MAX_MS", 0.0))
+                and not allow_stale_in_background
             )
             if stale_drop:
                 processed_points = {p: {"x": None, "y": None, "likelihood": None} for p in config.USE_POINTS}
@@ -872,6 +935,28 @@ def main() -> None:
             display_frame_id = display_packet.frame_id
             frame_delta = display_frame_id - pred_frame_id if pred_frame_id >= 0 else -1
             display_buffer_ms_actual = (display_ts - display_packet.capture_ts) * 1000.0
+            display_buffer_err_ms = display_buffer_ms_actual - requested_buffer_ms
+            buffer_on_target_now = abs(display_buffer_err_ms) <= buffer_tolerance_ms
+            buffer_diag["samples"] += 1
+            buffer_diag["sum_actual_ms"] += display_buffer_ms_actual
+            buffer_diag["sum_err_ms"] += display_buffer_err_ms
+            buffer_diag["sum_abs_err_ms"] += abs(display_buffer_err_ms)
+            if abs(display_buffer_err_ms) <= buffer_tolerance_ms:
+                buffer_diag["on_target"] += 1
+            if exact_match:
+                buffer_diag["exact_match"] += 1
+            if matched_pred is None:
+                buffer_diag["no_pred"] += 1
+            if stale_drop:
+                buffer_diag["stale_drop"] += 1
+            if frame_delta >= 0:
+                stats["frame_delta_sum"] += frame_delta
+                stats["frame_delta_count"] += 1
+            buffer_status_text = (
+                f"BUF {display_buffer_ms_actual:.1f}/{requested_buffer_ms:.1f}ms "
+                f"{'OK' if buffer_on_target_now else 'BAD'} "
+                f"delta_f={frame_delta}"
+            )
 
             # compute feature
             hind_angle = None
@@ -933,6 +1018,7 @@ def main() -> None:
                 fps_dlc,
                 skip_rate,
                 hind_angle,
+                buffer_status_text,
                 processing_active,
                 motion_score,
             )
@@ -942,8 +1028,25 @@ def main() -> None:
             t_disp0 = time.perf_counter()
             if config.SHOW_SCALE != 1.0:
                 display = cv2.resize(display, None, fx=config.SHOW_SCALE, fy=config.SHOW_SCALE, interpolation=cv2.INTER_AREA)
-            cv2.imshow(config.WINDOW_NAME, display)
-            key = cv2.waitKey(1) & 0xFF
+
+            if save_output_video:
+                if video_writer is None:
+                    output_video_path.parent.mkdir(parents=True, exist_ok=True)
+                    out_h, out_w = display.shape[:2]
+                    fps_for_writer = output_video_fps if output_video_fps > 0 else float(
+                        source.source_fps if isinstance(source, VideoFileSource) and source.source_fps > 0
+                        else getattr(config, "VIDEO_TARGET_FPS", 30.0)
+                    )
+                    fourcc = cv2.VideoWriter_fourcc(*str(getattr(config, "OUTPUT_VIDEO_CODEC", "mp4v")))
+                    video_writer = cv2.VideoWriter(str(output_video_path), fourcc, fps_for_writer, (out_w, out_h))
+                    if not video_writer.isOpened():
+                        raise RuntimeError(f"Cannot open output video for writing: {output_video_path}")
+                video_writer.write(display)
+
+            key = -1
+            if visual_mode:
+                cv2.imshow(config.WINDOW_NAME, display)
+                key = cv2.waitKey(1) & 0xFF
             display_ts = time.time()
             t_disp1 = time.perf_counter()
             stats["t_display_ms"] += (t_disp1 - t_disp0) * 1000.0
@@ -989,6 +1092,41 @@ def main() -> None:
                     reason_dict,
                 )
             prev_triplet_state = has_triplet
+
+            if frame_id % buffer_diag_every_n == 0:
+                diag_n = max(1.0, buffer_diag["samples"])
+                logger.info(
+                    "buffer_diag frame_id=%d target=%.1fms actual_mean=%.1fms err_mean=%.1fms abs_err_mean=%.1fms "
+                    "on_target=%.1f%% tol=±%.1fms exact_match=%.1f%% no_pred=%.1f%% stale_drop=%.1f%% "
+                    "frame_delta_last=%d frame_delta_mean=%.2f infer_q=%d frame_buf_len=%d pred_buf_len=%d",
+                    frame_id,
+                    requested_buffer_ms,
+                    buffer_diag["sum_actual_ms"] / diag_n,
+                    buffer_diag["sum_err_ms"] / diag_n,
+                    buffer_diag["sum_abs_err_ms"] / diag_n,
+                    100.0 * (buffer_diag["on_target"] / diag_n),
+                    buffer_tolerance_ms,
+                    100.0 * (buffer_diag["exact_match"] / diag_n),
+                    100.0 * (buffer_diag["no_pred"] / diag_n),
+                    100.0 * (buffer_diag["stale_drop"] / diag_n),
+                    frame_delta,
+                    (stats.get("frame_delta_sum", 0.0) / max(1.0, stats.get("frame_delta_count", 1.0))),
+                    infer_queue.qsize(),
+                    len(frame_buffer),
+                    len(preds_snapshot),
+                )
+                if buffer_diag["samples"] >= buffer_diag_warn_min_samples and (
+                    (buffer_diag["on_target"] / diag_n) < 0.3
+                ):
+                    logger.warning(
+                        "buffer_diag low on-target ratio: %.1f%% (target %.1fms, tol ±%.1fms). "
+                        "Likely bottleneck: frame buffer capacity, source jitter, or inference lag.",
+                        100.0 * (buffer_diag["on_target"] / diag_n),
+                        requested_buffer_ms,
+                        buffer_tolerance_ms,
+                    )
+                if buffer_diag_reset_after_log:
+                    buffer_diag.clear()
 
             if frame_id % max(1, config.LOG_EVERY_N_FRAMES) == 0:
                 raw_vis = stats["raw_visible"] / max(1.0, stats["total_points"]) * 100.0
@@ -1038,7 +1176,6 @@ def main() -> None:
                     display_ts,
                     bp_txt,
                 )
-
                 if getattr(config, "ENABLE_BENCHMARK_LOG_ROW", False):
                     path = Path(config.BENCHMARK_CSV_PATH)
                     with open(path, "a", newline="", encoding="utf-8") as f:
@@ -1077,6 +1214,8 @@ def main() -> None:
         stop_event.set()
         worker.join(timeout=1.0)
         source.release()
+        if 'video_writer' in locals() and video_writer is not None:
+            video_writer.release()
         cv2.destroyAllWindows()
 
 
