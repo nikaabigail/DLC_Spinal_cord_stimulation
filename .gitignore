@@ -22,3 +22,11 @@ venv/
 videos/
 outputs/
 debug/
+
+# Generated runtime artifacts (large; not source)
+*.mp4
+*.avi
+*.log
+*_benchmark.csv
+debug_snapshots/
+optimization/dump_*.csv
