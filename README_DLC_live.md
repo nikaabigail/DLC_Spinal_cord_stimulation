@@ -1,81 +1,94 @@
-# DLC Live Runtime
+🧠 Real-time DLC Pipeline (Spinal Cord / BCI)
+📌 Overview
 
-`rt_dlc_live.py` is a DLCLive-based realtime pipeline for low-latency pose inference.
+Проект реализует реалтайм-пайплайн оценки позы (pose estimation) для задач:
 
-## Current architecture
-
-- DLCLive handles model loading, preprocessing, and coordinate restoration.
-- `rt_dlc_live.py` handles source I/O, overlay, logging, benchmark CSV, and video save.
-- Online filtering is enabled through a DLCLive-compatible processor:
-  - `pcutoff` gate
-  - `despike`
-  - optional `hold`
-  - median smoothing
-
-## Run
-
-```bash
-conda activate dlc_live_env
-python rt_dlc_live.py
-```
-
-## Required packages
-
-- `numpy<2`
-- `opencv-python`
-- `deeplabcut-live[pytorch]`
-- `colorcet`
-
-Example install:
-
-```bash
-pip install "numpy<2" opencv-python==4.11.0.86 colorcet
+gait analysis
+spinal cord stimulation
+closed-loop neurofeedback
+BCI / neuroengineering
+🏗 Архитектура
+Старый пайплайн
+rt_dlc_obs.py
+кастомный inference runner
+сложный admission control
+skip frames
+буферизация
+высокая задержка
+Новый пайплайн (экспериментальный)
+rt_dlc_live.py
+DLCLive backend
+прямой inference
+минимальная задержка
+упрощённая архитектура
+⚙️ Окружения
+🔹 Основное (DLC 3)
+dlc_win_env
+deeplabcut 3.0.0rc13
+torch 2.10.0 + CUDA 12.8
+numpy 1.26.4
+opencv-python
+🔹 DLCLive окружение
+dlc_live_env
+Установленные пакеты:
+pip install "numpy<2"
+pip install opencv-python==4.11.0.86
 pip install deeplabcut-live[pytorch] --no-deps
-```
+pip install colorcet
+📦 Важные зависимости
+пакет	версия
+torch	2.10.0+cu128
+numpy	1.26.x
+opencv-python	4.11.x
+deeplabcut-live	1.1.0
+🧠 Модель
 
-## Config overview (`config_rt_dlc_live.py`)
+Путь:
 
-Frame source:
-- `USE_VIDEO_FILE`, `VIDEO_FILE_PATH`, `CAM_INDEX`
-- `VIDEO_TARGET_FPS`, `VIDEO_SKIP_IF_BEHIND`
-- `FRAME_W`, `FRAME_H`, `TARGET_VIDEO_FPS`
+C:\dlc\project\r_tm_side-og-2024-10-25\exported-models-pytorch\
 
-Model:
-- `MODEL_PATH`, `MODEL_TYPE`, `PRECISION`, `DEVICE`
-- `SINGLE_ANIMAL`, `CONVERT_TO_RGB`
+Используется:
 
-DLCLive preprocessing:
-- `CROPPING` (`[x1, x2, y1, y2]` or `None`)
-- `RESIZE`
-- `DYNAMIC_CROPPING`
+*.pt snapshot (best)
+▶️ Запуск
+conda activate dlc_live_env
 
-Points and filtering:
-- `USE_POINTS`
-- `ENABLE_PROCESSOR`, `ENABLE_PCUTOFF`, `ENABLE_DESPIKE`, `ENABLE_HOLD`
-- `CONF_THRESH_USE`, `CONF_THRESH_DRAW`
-- `DESPIKE_THRESHOLD_PX`, `DESPIKE_RESET_GAP_FRAMES`
-- `MAX_HOLD_FRAMES`, `MEDIAN_WINDOW`
+python rt_dlc_live.py
+📊 Текущие метрики
+inference time: ~20 ms
+dlc fps: 25–50
+latency: минимальная
+visible: ⚠ ~20% (нужно исправить)
+⚠️ Известные проблемы
+1. Низкая точность (visible)
 
-Overlay and angle:
-- `DRAW_POINTS`, `DRAW_NAMES`, `DRAW_CONF`, `DRAW_FPS`, `DEBUG_OVERLAY`
-- `COMPUTE_HIND_ANGLE`, `HIND_ANGLE_POINTS`
+Причины:
 
-Output:
-- `SAVE_OUTPUT_VIDEO`, `OUTPUT_VIDEO_PATH`, `OUTPUT_VIDEO_FPS`, `OUTPUT_VIDEO_CODEC`
+несовпадение bodyparts
+порог confidence
+отсутствие фильтрации
+2. Нет фильтрации
 
-Logging:
-- `LOG_PATH`, `LOG_LEVEL`, `LOG_EVERY_N_FRAMES`
-- `ENABLE_BENCHMARK_CSV`, `BENCHMARK_CSV_PATH`
+В текущей версии отсутствуют:
 
-## Speed and timeline behavior
+median filter
+despike
+hold
+3. Нет ROI
 
-- `VIDEO_TARGET_FPS = 0.0` means "no artificial pacing for file input".
-- `OUTPUT_VIDEO_FPS = 0.0` means "use source FPS when available".
-- Keep `VIDEO_SKIP_IF_BEHIND = False` for offline analysis/export to avoid timeline distortion.
-- Enable `VIDEO_SKIP_IF_BEHIND = True` only when you prefer lower visual latency over full frame preservation.
+Используется full-frame inference
 
-## Environment variable overrides
+🚧 Roadmap
+ debug output DLCLive
+ восстановить фильтрацию
+ сравнить с baseline (rt_dlc_obs)
+ добавить causal smoothing
+ интеграция с BCI pipeline
+🧪 Использование
 
-- `DLC_LIVE_VIDEO_PATH`
-- `DLC_LIVE_MODEL_PATH`
+Подходит для:
 
+real-time gait detection
+neuroscience experiments
+closed-loop stimulation
+pose-based control systems

@@ -1,69 +1,122 @@
-# DLC Live Integration History
+🚀 DLC Live Integration — Development History
+📍 Context
 
-Краткая история миграции realtime-инференса на DLCLive.
+Цель: заменить кастомный realtime-пайплайн (rt_dlc_obs.py) на более стабильный и низколатентный inference через DeepLabCut Live (DLCLive).
 
-## Stage 1 — проблемы старого контура (`rt_dlc_obs.py`)
+🔹 Stage 1 — Проблемы исходного пайплайна
 
-- заметная задержка между кадром и предсказанием;
-- высокий `skip_rate`;
-- нестабильный реальный infer FPS;
-- сильная зависимость от admission-control параметров.
+Выявленные проблемы в rt_dlc_obs.py:
 
-**Вывод:** для low-latency closed-loop сценария требовался более простой inference backend.
+❌ Задержка предсказаний (lag между кадром и точками)
+❌ Высокий skip_rate (~70%)
+❌ Нестабильный FPS инференса
+❌ Сильная зависимость от admission control (skip_n / skip_fps)
+❌ Не realtime-архитектура (single loop + throttling)
 
-## Stage 2 — попытка исправить задержку буферизацией
+Результат:
+→ Пайплайн не подходит для low-latency BCI / closed-loop задач
 
-Добавлялись:
+🔹 Stage 2 — Введение буферизации
 
-- display/inference буфер,
-- метрики синхронизации (`frame_delta`, `pred_age_ms`).
+Реализовано:
 
-**Результат:** визуально стабильнее, но задержка выросла.
+📦 Буфер кадров (~100 ms)
+🎯 Синхронизация display ↔ inference
+📊 Метрики:
+display_frame_id
+pred_frame_id
+frame_delta
+pred_age_ms
 
-## Stage 3 — переход на DLCLive
+Результат:
 
-Принято решение заменить кастомный inference-контур на `deeplabcut-live`.
+✔ Визуально smoother
+❌ Но latency вырос (~100–120 ms)
+❌ Не решает проблему skip_rate
+🔹 Stage 3 — Переход на DLC Live
+
+Принято решение:
+→ Использовать DLCLive как backend для inference
 
 Причины:
 
-- более прямой путь кадра к инференсу,
-- меньше инфраструктурного кода,
-- ниже end-to-end latency.
+минимальная задержка
+отсутствие skip-пайплайна
+оптимизированный inference runner
+🔹 Stage 4 — Экспорт модели
 
-## Stage 4 — экспорт модели
+Выполнено:
 
-Подготовлен exported model для DLCLive (`exported-models-pytorch/...`).
+deeplabcut.export_model(...)
 
-## Stage 5 — выделение отдельного окружения
+Результат:
 
-Создано отдельное окружение `dlc_live_env` для изоляции зависимостей от основного DLC 3 окружения.
+exported-models-pytorch/
+  DLC_r_tm_side_resnet_50_iteration-0_shuffle-5/
+    *.pt
 
-## Stage 6 — стабилизация зависимостей
+✔ Модель готова для DLCLive
 
-Исправлены типичные проблемы:
+🔹 Stage 5 — Новое окружение
 
-- отсутствие `colorcet`,
-- несовместимость с `numpy>=2`,
-- `opencv-python-headless` без `imshow`.
+Создано отдельное окружение:
 
-## Stage 7 — минимальный runtime
+dlc_live_env
 
-Собран `rt_dlc_live.py`:
+Причина:
 
-- без очередей и сложной skip-логики,
-- inference на каждом кадре,
-- простой overlay + базовые метрики FPS.
+изоляция от DLC 3 (TensorFlow/PyTorch конфликты)
+контроль зависимостей
+🔹 Stage 6 — Установка DLCLive
+pip install deeplabcut-live[pytorch] --no-deps
+pip install colorcet
 
-## Stage 8 — текущее состояние
+Фиксы:
 
-- infer time: примерно `16–25 ms` (зависит от GPU/размера входа),
-- dlc fps: обычно `25–50`,
-- latency: низкая,
-- открытый вопрос: низкий `visible` в части сессий.
+❗ ModuleNotFoundError → colorcet
+❗ numpy incompatibility → откат до <2
+🔹 Stage 7 — Проблема OpenCV GUI
 
-## Next steps
+Ошибка:
 
-1. проверить соответствие `BODY_PARTS` порядку в exported model;
-2. сохранить raw output DLCLive для сравнения с `rt_dlc_obs.py`;
-3. вернуть причинно-устойчивую фильтрацию (hold + median);
-4. подобрать confidence порог и/или ROI под конкретный сетап.
+cv2.imshow not implemented
+
+Причина:
+
+установлен opencv-python-headless
+
+Решение:
+
+pip install opencv-python
+pip install "numpy<2"
+🔹 Stage 8 — Минимальный rt_dlc_live.py
+
+Создан новый пайплайн:
+
+❌ без очередей
+❌ без skip logic
+❌ без фильтров
+✔ прямой inference на каждом кадре
+✔ DLCLive backend
+🔹 Stage 9 — Текущие метрики
+infer_time ≈ 16–25 ms
+dlc_fps ≈ 25–50
+cam_fps ≈ 25–35
+latency ≈ минимальная (без буфера)
+🔴 Текущая проблема
+visible ≈ 20% (очень низко)
+
+Возможные причины:
+
+❗ mismatch BODY_PARTS
+❗ другой scaling входа
+❗ отличие output формата DLCLive
+❗ слишком высокий CONF_THRESH_DRAW
+❗ отсутствие фильтрации (noise)
+🎯 Следующие шаги
+ проверить порядок bodyparts
+ логировать raw pose
+ сравнить с rt_dlc_obs output
+ добавить фильтр (hold + median)
+ оптимизировать confidence threshold
+ протестировать ROI снова
